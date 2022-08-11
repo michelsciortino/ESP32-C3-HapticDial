@@ -7,12 +7,6 @@
 #include <driver/adc.h>
 #include "sdkconfig.h"
 #include "esp_sleep.h"
-
-#if !CONFIG_BT_NIMBLE_EXT_ADV
-#error Must enable NimBLE extended advertising
-#endif
-
-#include "esp_log.h"
 static const char *LOG_TAG = "HAPTIC_DIAL";
 
 #define RADIAL_CONTROLLER_REPORT_ID 0x01
@@ -22,7 +16,7 @@ static const char *LOG_TAG = "HAPTIC_DIAL";
 // Integrated Radial Controller TLC
 static const uint8_t _HapticDialHIDReportDescriptor[] = {
     USAGE_PAGE(1), 0x01, // Generic Desktop
-    USAGE(1), 0x0e,      // System Multi-Axis Controller
+    USAGE(1), 0x0e,      // Serial Multi-Axis Controller
     COLLECTION(1), 0x01, // Application
     // Radial controller
     REPORT_ID(1), RADIAL_CONTROLLER_REPORT_ID, // Radial Controller
@@ -45,7 +39,7 @@ static const uint8_t _HapticDialHIDReportDescriptor[] = {
     UNIT_EXPONENT(1), 0x0f,          // -1
     UNIT(1), 0x14,                   // Degrees, English Rotation
     PHYSICAL_MINIMUM(2), 0xf0, 0xf1, // -3600
-    PHYSICAL_MAXIMUM(1), 0x10, 0x0e, // 3600
+    PHYSICAL_MAXIMUM(2), 0x10, 0x0e, // 3600
     LOGICAL_MINIMUM(2), 0xf0, 0xf1,  // -3600
     LOGICAL_MAXIMUM(2), 0x10, 0x0e,  // 3600
     HIDINPUT(1), 0x06,               // Data,Var,Rel
@@ -65,14 +59,14 @@ static const uint8_t _HapticDialHIDReportDescriptor[] = {
     REPORT_SIZE(1), 0x08,            // 8
     LOGICAL_MINIMUM(1), 0x03,        // 3
     LOGICAL_MAXIMUM(1), 0x03,        // 3
-    PHYSICAL_MINIMUM(1), 0x03, 0x10, // 0x1003
-    PHYSICAL_MAXIMUM(1), 0x03, 0x10, // 0x1003
+    PHYSICAL_MINIMUM(2), 0x03, 0x10, // 0x1003
+    PHYSICAL_MAXIMUM(2), 0x03, 0x10, // 0x1003
     FEATURE(1), 0x03,                // Cnst,Var,Abs
     USAGE(1), 0x04,                  // Ordinal 4
     LOGICAL_MINIMUM(1), 0x04,        // 4
     LOGICAL_MAXIMUM(1), 0x04,        // 4
-    PHYSICAL_MINIMUM(1), 0x04, 0x10, // 0x1004
-    PHYSICAL_MAXIMUM(1), 0x04, 0x10, // 0x1004
+    PHYSICAL_MINIMUM(2), 0x04, 0x10, // 0x1004
+    PHYSICAL_MAXIMUM(2), 0x04, 0x10, // 0x1004
     FEATURE(1), 0x03,                // Cnst,Var,Abs
     END_COLLECTION(0),               // END_COLLECTION
     // Duration List
@@ -148,20 +142,21 @@ static void delay_ms(uint64_t ms)
     }
 }
 
+#if defined(CONFIG_BT_NIMBLE_EXT_ADV)
 /* Callback class to handle advertising events */
 class AdvCallbacks : public NimBLEExtAdvertisingCallbacks
 {
     void onStopped(NimBLEExtAdvertising *pAdv, int reason, uint8_t inst_id)
     {
         /* Check the reason advertising stopped, don't sleep if client is connecting */
-        printf("Advertising instance %u stopped\n", inst_id);
+        INFO("Advertising instance %u stopped", inst_id);
         switch (reason)
         {
         case 0:
-            printf("Client connecting\n");
+            INFO("Client connecting");
             return;
         case BLE_HS_ETIMEOUT:
-            printf("Time expired - sleeping for %u seconds\n", _sleep_seconds);
+            INFO("Time expired - sleeping for %u seconds", _sleep_seconds);
             break;
         default:
             break;
@@ -176,78 +171,124 @@ private:
 public:
     AdvCallbacks(uint32_t sleepSeconds) : _sleep_seconds(sleepSeconds){};
 };
+#endif
 
 BleHapticDial::BleHapticDial(
     std::string deviceName, std::string deviceManufacturer,
     uint16_t vid, uint16_t pid, uint16_t version,
-    uint8_t batteryLevel = 100, uint32_t debounceTime = 10)
+    uint8_t batteryLevel, uint32_t debounceTime)
     : _device_name(deviceName), _device_manufacturer(deviceManufacturer),
       _vid(vid), _pid(pid), _version(version),
-      _battery_level(batteryLevel), _debounce_ms(debounceTime) {}
+      _battery_level(batteryLevel), _debounce_ms(debounceTime)
+{
+}
 
 void BleHapticDial::reset(void)
 {
+    INFO("Resetting");
     _button_status = false;
     _dial_degree = 0;
 }
 
 void BleHapticDial::begin(void)
 {
-    this->reset();
+    xTaskCreate(this->taskServer, "server", 20000, (void *)this, 5, NULL); // BLE HID start process
+}
 
-    NimBLEDevice::init(_device_name);
+void BleHapticDial::taskServer(void *pInstance)
+{
+    BleHapticDial *dial = (BleHapticDial *)pInstance; // static_cast<BleHapticDial *>(pInstance);
+
+    INFO("Begin");
+    dial->reset();
+
+    INFO("Initializing BLE env");
+    NimBLEDevice::init(dial->_device_name);
+    INFO("Setting the authorization mode, enabling pairing");
     NimBLEDevice::setSecurityAuth(true, true, true);
 
     // Creating BLE server
-    _server = NimBLEDevice::createServer();
+    INFO("Creating server");
+    dial->_server = NimBLEDevice::createServer();
 
     // Setting this object as HID callbacks listener
-    _server->setCallbacks(this);
+    INFO("Setting this object as HID callbacks listener");
+    dial->_server->setCallbacks(dial);
 
     // Registering hid device on server
-    _hid_device = new NimBLEHIDDevice(_server);
-    _hid_device->manufacturer(_device_manufacturer);
-    _hid_device->pnp(0x02, _vid, _pid, _version);
-    _hid_device->hidInfo(0x00, 0x01);
-    _hid_device->reportMap((uint8_t *)_HapticDialHIDReportDescriptor, sizeof(_HapticDialHIDReportDescriptor));
-    _hid_device->setBatteryLevel(_battery_level);
+    INFO("Registering hid device on server");
+    dial->_hid_device = new NimBLEHIDDevice(dial->_server);
 
-    // Radial controller handle
-    _radial_controller = _hid_device->inputReport(RADIAL_CONTROLLER_REPORT_ID);
+    INFO("Setting pnp characteristic");
+    dial->_hid_device->pnp(0x02, dial->_vid, dial->_pid, dial->_version);
+    
+    INFO("Setting manufacturer characteristic");
+    dial->_hid_device->manufacturer();
+    dial->_hid_device->manufacturer(dial->_device_manufacturer);
+    
+    INFO("Setting hidInfo characteristic");
+    dial->_hid_device->hidInfo(0x00, 0x01);
+
+    INFO("Setting HID Report");
+    ESP_LOGD (LOG_TAG, " reportMap set: start " );
+    ESP_LOGD (LOG_TAG, " reportMap set: size %D " , sizeof(_HapticDialHIDReportDescriptor) );
+    dial->_hid_device->reportMap((uint8_t *)_HapticDialHIDReportDescriptor, sizeof(_HapticDialHIDReportDescriptor));
+    
+    // Radial controller input
+    INFO("Creating Radial controller input");
+    dial->_radial_controller = dial->_hid_device->inputReport(RADIAL_CONTROLLER_REPORT_ID);
+    dial->_radial_controller->setCallbacks(dial);
 
     // Haptic feedback handle
-    _haptic_feedback = _hid_device->outputReport(HAPTIC_FEEDBACK_REPORT_ID);
-    _haptic_feedback->setCallbacks(this);
+    INFO("Creating Haptic feedback handle");
+    dial->_haptic_feedback = dial->_hid_device->outputReport(HAPTIC_FEEDBACK_REPORT_ID);
+    dial->_haptic_feedback->setCallbacks(dial);
+
+    INFO("Setting battery level");
+    dial->_hid_device->setBatteryLevel(dial->_battery_level);
 
     // Starting HID service
-    _hid_device->startServices();
-    onStarted();
+    INFO("Starting HID service");
+    dial->_hid_device->startServices();
+    dial->onStarted();
 
     // Setting advertising
+    INFO("Setting advertising");
+#if defined(CONFIG_BT_NIMBLE_EXT_ADV)
     NimBLEExtAdvertisement extAdv(BLE_HCI_LE_PHY_CODED, BLE_HCI_LE_PHY_1M);
     extAdv.setConnectable(true);
     extAdv.setScannable(false);
-    extAdv.setServiceData(_hid_device->hidService()->getUUID(), _device_name);
-    extAdv.setCompleteServices16({NimBLEUUID(_hid_device->hidService()->getUUID())});
+    extAdv.setServiceData(dial->_hid_device->hidService()->getUUID(), dial->_device_name);
+    extAdv.setCompleteServices16({NimBLEUUID(dial->_hid_device->hidService()->getUUID())});
 
     auto adv = NimBLEDevice::getAdvertising();
-    adv->setCallbacks(new AdvCallbacks(_ble_adv_sleep_s));
-
+    adv->setCallbacks(new AdvCallbacks(dial->_ble_adv_sleep_s));
     if (adv->setInstanceData(0, extAdv))
     {
-        if (adv->start(0, _ble_adv_time))
-            printf("Started advertising\n");
+        if (adv->start(0, dial->_ble_adv_time))
+            INFO("Started advertising");
         else
-            printf("Failed to start advertising\n");
+            INFO("Failed to start advertising");
     }
     else
-        printf("Failed to register advertisment data\n");
+        INFO("Failed to register advertisment data");
 
-    esp_sleep_enable_timer_wakeup(_ble_adv_sleep_s * 1000000);
+        // INFO(("Enabling wakeup by timer of" + std::to_string(_ble_adv_sleep_s) + "s").c_str());
+        // esp_sleep_enable_timer_wakeup(_ble_adv_sleep_s * 1000000);
+#else
+    auto adv = dial->_server->getAdvertising();
+    adv->setAppearance(GENERIC_HID);
+    adv->addServiceUUID(dial->_hid_device->hidService()->getUUID());
+    adv->setScanResponse(false);
+    adv->start();
+#endif
+    ESP_LOGD(LOG_TAG, "Advertising started!");
+    vTaskDelay(portMAX_DELAY);
 }
 
 void BleHapticDial::end(void)
 {
+    INFO("End");
     this->reset();
 }
 
@@ -265,6 +306,7 @@ void BleHapticDial::setBatteryLevel(uint8_t level)
 
 void BleHapticDial::sendReport(void)
 {
+    INFO("Sending report");
     HID_DialReport_Data_t report;
     report.button = _button_status;
     report.rotation = _dial_degree;
@@ -277,15 +319,50 @@ void BleHapticDial::sendReport(void)
     }
 }
 
-void BleHapticDial::onConnect(void)
+/*
+void BleHapticDial::onConnect(NimBLEServer *server)
+{
+    INFO("Device connected. No connection descriptor found.");
+    this->_connected = true;
+};*/
+
+void BleHapticDial::onConnect(NimBLEServer *server, ble_gap_conn_desc *desc)
 {
     this->_connected = true;
-}
+    INFO("Client connected. Client address: %s", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+    INFO("Multi-connect support: start advertising");
+};
 
-void BleHapticDial::onDisconnect(void)
+/*
+void BleHapticDial::onDisconnect(NimBLEServer *server)
 {
+    INFO("onDisconnect");
     this->_connected = false;
 }
+*/
+
+void BleHapticDial::onDisconnect(NimBLEServer *server, ble_gap_conn_desc *desc)
+{
+    this->_connected = false;
+    INFO("Client disconnected - start advertising");
+}
+
+void BleHapticDial::onRead(NimBLECharacteristic *characteristic)
+{
+    INFO("%s: onRead(), value: %s", characteristic->getUUID().toString().c_str(), characteristic->getValue().c_str());
+};
+
+void BleHapticDial::onWrite(NimBLECharacteristic *characteristic)
+{
+    INFO("%s: onWrite(), value: %s", characteristic->getUUID().toString().c_str(),characteristic->getValue().c_str());
+};
+
+// Called before notification or indication is sent,
+// the value can be changed here before sending if desired.
+void BleHapticDial::onNotify(NimBLECharacteristic *characteristic)
+{
+    INFO("Sending notification to clients");
+};
 
 void BleHapticDial::button(bool pressed)
 {
@@ -298,16 +375,19 @@ void BleHapticDial::button(bool pressed)
 
 void BleHapticDial::press(void)
 {
+    INFO("Pressing button");
     this->button(true);
 }
 
 void BleHapticDial::release(void)
 {
+    INFO("Releasing button");
     this->button(false);
 }
 
 void BleHapticDial::click(void)
 {
+    INFO("Clicking");
     this->press();
     this->release();
 }

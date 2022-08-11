@@ -1,9 +1,12 @@
 #pragma once
 #include "sdkconfig.h"
+#include <string>
+#include "macro.h"
 
 #if defined(CONFIG_BT_ENABLED)
 
-#include <NimBLEDevice.h>
+#include "NimBLEDevice.h"
+#include "NimBLEHIDDevice.h"
 
 #define MS_VID 0x045E
 #define MS_PID 0x0905
@@ -39,31 +42,37 @@ private:
     NimBLECharacteristic *_haptic_feedback;
 
 public:
-    inline BleHapticDial(std::string deviceName = "ESP32 HapticDial",
-                         std::string deviceManufacturer = "Espressif",
-                         uint16_t vid = MS_VID,
-                         uint16_t pid = MS_PID,
-                         uint16_t version = MS_VER,
-                         uint8_t batteryLevel = 255,
-                         uint32_t debounceTime = 10);
-    inline void begin(void);
-    inline void end(void);
-    inline void click(void);
-    inline void press(void);
-    inline void release(void);
-    inline void rotate(int16_t degree);
-    inline bool isPressed(void);
-    inline int16_t getDialDegrees(void);
-    inline bool isConnected(void);
-    inline void setBatteryLevel(uint8_t level);
+    BleHapticDial(std::string deviceName = "ESP32 HapticDial",
+                  std::string deviceManufacturer = "Espressif",
+                  uint16_t vid = MS_VID,
+                  uint16_t pid = MS_PID,
+                  uint16_t version = MS_VER,
+                  uint8_t batteryLevel = 255,
+                  uint32_t debounceTime = 10);
+    void begin(void);
+    void end(void);
+    void click(void);
+    void press(void);
+    void release(void);
+    void rotate(int16_t degree);
+    bool isPressed(void);
+    int16_t getDialDegrees(void);
+    bool isConnected(void);
+    void setBatteryLevel(uint8_t level);
 
 protected:
-    inline void button(bool pressed);
-    virtual void onStarted(void){};
-    virtual void onConnect(void);
-    virtual void onDisconnect(void);
+    void button(bool pressed);
+    virtual void onStarted() {};
+    //virtual void onConnect(NimBLEServer *server) override;
+    virtual void onConnect(NimBLEServer *server, ble_gap_conn_desc *desc) override;
+    //virtual void onDisconnect(NimBLEServer *server) override;
+    virtual void onDisconnect(NimBLEServer *server, ble_gap_conn_desc *desc) override;
+    virtual void onRead(BLECharacteristic* characteristic) override;
+    virtual void onWrite(BLECharacteristic* characteristic) override;
+    virtual void onNotify(BLECharacteristic* characteristic) override;
     virtual void sendReport(void);
-    inline void reset(void);
+    static void taskServer(void *pInstance);
+    void reset(void);
 };
 
 #endif // CONFIG_BT_ENABLED
